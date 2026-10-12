@@ -39,7 +39,7 @@ venv\Scripts\activate
 source venv/bin/activate
 ```
 
-## Dependence
+## Dependencies
 ```
 pip install -r requirements.txt
 ```
