@@ -43,7 +43,7 @@ source venv/bin/activate
 ```
 pip install -r requirements.txt
 ```
-- Create a .env file and add your Discord token
+- Create a .env file and add your tokens
 
 ## Start
 ```
