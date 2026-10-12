@@ -1,14 +1,12 @@
-import os, sys, discord, yt_dlp, asyncio, spotipy
+import os, sys, discord, yt_dlp, asyncio, spotipy, requests, json
 from spotipy.oauth2 import SpotifyClientCredentials
 from dotenv import load_dotenv
 from discord.ext import commands
-
 load_dotenv()
 
 TK_DISCORD = os.getenv("TK_DISCORD")
 SPOTIPY_CLIENT_ID = os.getenv("SPTFY")
 SPOTIPY_CLIENT_SECRET = os.getenv("SPTFYS")
-
 
 if not TK_DISCORD:
     sys.exit("Error: Token no especificado en variables de entorno")
@@ -33,9 +31,63 @@ loop_states = {}
 queues = {}
 current_track = {}
 last_player_message = {}
+playlist_tasks = {}
 sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
         client_id=SPOTIPY_CLIENT_ID, 
         client_secret=SPOTIPY_CLIENT_SECRET))
+
+def create_queue_embed(guild_id: int) -> discord.Embed:
+    curr = current_track.get(guild_id)
+    songs_list = list(queues[guild_id]._queue) if guild_id in queues else []
+    total_in_queue = len(songs_list)
+
+    embed = discord.Embed(
+        title="📜 Lista de Reproducción",
+        color=0x9B59B6
+    )
+
+    if curr:
+        c_dur = curr.get('duration') or 0
+        c_time = f"{c_dur // 60:02d}:{c_dur % 60:02d}" if c_dur > 0 else "EN VIVO"
+        embed.add_field(
+            name="🎧 Sonando Ahora",
+            value=f"**[{curr['title']}]({curr['webpage_url']})** `[{c_time}]`",
+            inline=False
+        )
+
+    if songs_list:
+        lines = []
+        for i, song in enumerate(songs_list[:10]):
+            dur = song.get('duration') or 0
+            dur_str = f"{dur // 60:02d}:{dur % 60:02d}" if dur > 0 else "EN VIVO"
+            title = song['title']
+            if len(title) > 42:
+                title = f"{title[:39]}..."
+            lines.append(f"`{i+1:02d}.` **[{title}]({song['webpage_url']})** `[{dur_str}]`")
+
+        embed.add_field(
+            name="A continuación",
+            value="\n".join(lines),
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="A continuación",
+            value="*No hay más pistas en espera.*",
+            inline=False
+        )
+
+    total_duration = sum((s.get('duration') or 0) for s in songs_list)
+    mins, secs = divmod(total_duration, 60)
+    hours, mins = divmod(mins, 60)
+    time_str = f"{hours}h {mins:02d}m" if hours > 0 else f"{mins:02d}:{secs:02d}"
+
+    footer_text = f"Pistas en espera: {total_in_queue} • Duración estimada: {time_str}"
+    if total_in_queue > 10:
+        footer_text = f"Mostrando 10 de {total_in_queue} pistas • Duración: {time_str}"
+    embed.set_footer(text=footer_text)
+
+    return embed
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -43,7 +95,7 @@ class MusicControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    # --- FILA 0 (4 botones de flujo de audio) ---
+    # --- FILA 0 (4 botones) ---
     @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="⏸️", row=0)
     async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         client_voice = interaction.guild.voice_client
@@ -75,7 +127,7 @@ class MusicControls(discord.ui.View):
         else:
             await interaction.response.send_message("No hay nada que saltar.", ephemeral=True)
             
-    # --- FILA 1 (4 botones de lista y parada) ---
+    # --- FILA 1 (4 botones) ---
     @discord.ui.button(label="Loop", style=discord.ButtonStyle.secondary, emoji="🔁", row=0)
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = interaction.guild_id
@@ -88,30 +140,57 @@ class MusicControls(discord.ui.View):
     async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         client_voice = interaction.guild.voice_client
         guild_id = interaction.guild_id
-        if client_voice and (client_voice.is_playing() or client_voice.is_paused()):
+        
+        bg_task = playlist_tasks.get(guild_id)
+        has_task = bg_task is not None and not bg_task.done()
+        has_queue = guild_id in queues and not queues[guild_id].empty()
+        is_playing = client_voice is not None and (client_voice.is_playing() or client_voice.is_paused())
+
+        if is_playing or has_queue or has_task:
+            if bg_task and not bg_task.done():
+                bg_task.cancel()
+                playlist_tasks[guild_id] = None
+
             queues[guild_id] = asyncio.Queue()
-            loop_states[guild_id] = False
             current_track[guild_id] = None
-            client_voice.stop()
-            await interaction.response.send_message("Reproducción detenida y lista vaciada.", ephemeral=True)
+            loop_states[guild_id] = False
+
+            if client_voice and (client_voice.is_playing() or client_voice.is_paused()):
+                client_voice.stop()
+
+            await interaction.response.send_message("Reproducción detenida, lista vaciada y tareas canceladas.", ephemeral=True)
         else:
-            await interaction.response.send_message("No hay ninguna pista sonando.", ephemeral=True)
+            await interaction.response.send_message("No hay ninguna pista activa ni en lista.", ephemeral=True)
         
     @discord.ui.button(label="Queue", style=discord.ButtonStyle.secondary, emoji="📜", row=1)
     async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = interaction.guild_id
-        if guild_id not in queues or queues[guild_id].empty():
-            await interaction.response.send_message("La lista está vacía.", ephemeral=True)
+        is_empty = guild_id not in queues or queues[guild_id].empty()
+        curr = current_track.get(guild_id)
+
+        if is_empty and not curr:
+            await interaction.response.send_message("La lista está vacía y no hay nada sonando.", ephemeral=True)
             return
 
-        songs_list = list(queues[guild_id]._queue)
-        text_list = "**Lista de reproducción actual:**\n"
-        for i, song in enumerate(songs_list[:10]):
-            text_list += f"{i+1}. {song['title']}\n"
-        if len(songs_list) > 10:
-            text_list += f"... y {len(songs_list) - 10} más en espera.\n"
+        embed = create_queue_embed(guild_id)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        await interaction.response.send_message(text_list, ephemeral=True)
+    @discord.ui.button(label="Clear", style=discord.ButtonStyle.secondary, emoji="🗑️", row=1)
+    async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild_id = interaction.guild_id
+        bg_task = playlist_tasks.get(guild_id)
+        has_task = bg_task is not None and not bg_task.done()
+        has_queue = guild_id in queues and not queues[guild_id].empty()
+
+        if has_queue or has_task:
+            if bg_task and not bg_task.done():
+                bg_task.cancel()
+                playlist_tasks[guild_id] = None
+
+            queues[guild_id] = asyncio.Queue()
+            await interaction.response.send_message("Cola de espera vaciada. La canción actual continuará hasta finalizar.", ephemeral=True)
+        else:
+            await interaction.response.send_message("No hay canciones en espera para limpiar.", ephemeral=True)
 
 @bot.event
 async def on_ready():
@@ -126,6 +205,11 @@ async def on_voice_state_update(member, before, after):
     if before.channel is not None and after.channel is None:
         guild_id = member.guild.id
         
+        bg_task = playlist_tasks.get(guild_id)
+        if bg_task and not bg_task.done():
+            bg_task.cancel()
+            playlist_tasks[guild_id] = None
+
         queues[guild_id] = asyncio.Queue()
         current_track[guild_id] = None
         loop_states[guild_id] = False
@@ -171,6 +255,11 @@ async def leave(ctx):
     if client_voice.is_playing() or client_voice.is_paused():
         client_voice.stop()
         
+    bg_task = playlist_tasks.get(guild_id)
+    if bg_task and not bg_task.done():
+        bg_task.cancel()
+        playlist_tasks[guild_id] = None
+
     queues[guild_id] = asyncio.Queue()
     current_track[guild_id] = None
     loop_states[guild_id] = False
@@ -209,7 +298,7 @@ async def play_next(ctx):
     client_voice.play(source, after=after_playing)
 
     dur = song.get('duration') or 0
-    dur_str = f"{dur // 60:02d}:{dur % 66:02d}" if dur > 0 else "EN VIVO"
+    dur_str = f"{dur // 60:02d}:{dur % 60:02d}" if dur > 0 else "EN VIVO"
 
     embed = discord.Embed(
         title="♫ Reproduciendo Ahora",
@@ -260,6 +349,12 @@ async def load_spotify_playlist_background(ctx, queries, requester):
                 
                 if guild_id in queues:
                     await queues[guild_id].put(song)
+                    
+                    client_voice = ctx.guild.voice_client
+                    if client_voice and not client_voice.is_playing() and not client_voice.is_paused():
+                        await play_next(ctx)
+        except asyncio.CancelledError:
+            break
         except Exception as e:
             print(f"[Spotify Bridge] Error buscando '{query}': {e}")
             
@@ -282,22 +377,18 @@ async def play(ctx,* , search):
         search = f"ytsearch1:{query}"
         
     elif "open.spotify.com/playlist/" in search:
-        results = sp.playlist_items(search)
-        queries = []
-        for item in results.get('items', []):
-            track = item.get('track')
-            if track and track.get('name') and track.get('artists'):
-                queries.append(f"{track['artists'][0]['name']} {track['name']}")
-                
+        queries = get_spotify_playlist_tracks(search)
+        
         if not queries:
-            await ctx.send("No se encontraron pistas válidas en la playlist.")
+            await ctx.send("No se pudieron cargar las pistas de esta playlist.")
             return
-        
+
         search = f"ytsearch1:{queries[0]}"
-        
+
         if len(queries) > 1:
-            await ctx.send(f"Playlist de Spotify detectada: Cargando {len(queries)} pistas...", delete_after=8)
-            asyncio.create_task(load_spotify_playlist_background(ctx, queries[1:], ctx.author.display_name))
+            await ctx.send(f"📥 Playlist de Spotify detectada: Cargando {len(queries)} pistas...", delete_after=8)
+            task = asyncio.create_task(load_spotify_playlist_background(ctx, queries[1:], ctx.author.display_name))
+            playlist_tasks[ctx.guild.id] = task
     
     if not search.startswith("http") and not search.startswith("ytsearch"):
         search = f"ytsearch1:{search}"
@@ -331,18 +422,34 @@ async def play(ctx,* , search):
 @bot.command()
 async def stop(ctx):
     client_voice = ctx.guild.voice_client
+    guild_id = ctx.guild.id
     
     if client_voice is None:
         await ctx.send("No estoy conectado a ningún canal de voz.")
         return
         
-    if not client_voice.is_playing() and not client_voice.is_paused():
-        await ctx.send("No hay ninguna pista reproduciéndose actualmente.")
+    bg_task = playlist_tasks.get(guild_id)
+    has_task = bg_task is not None and not bg_task.done()
+    has_queue = guild_id in queues and not queues[guild_id].empty()
+    is_playing = client_voice.is_playing() or client_voice.is_paused()
+
+    if not is_playing and not has_queue and not has_task:
+        await ctx.send("No hay ninguna pista reproduciéndose ni en espera.")
         return
     
-    client_voice.stop()
-    await ctx.send("Reproducción detenida.")
-    
+    if bg_task and not bg_task.done():
+        bg_task.cancel()
+        playlist_tasks[guild_id] = None
+
+    queues[guild_id] = asyncio.Queue()
+    current_track[guild_id] = None
+    loop_states[guild_id] = False
+
+    if is_playing:
+        client_voice.stop()
+        
+    await ctx.send("Reproducción detenida, lista vaciada y tareas en segundo plano canceladas.")
+
 @bot.command()
 async def pause(ctx):
     client_voice = ctx.guild.voice_client
@@ -390,21 +497,57 @@ async def loop(ctx):
 @bot.command()
 async def queue(ctx):
     guild_id = ctx.guild.id
+    is_empty = guild_id not in queues or queues[guild_id].empty()
+    curr = current_track.get(guild_id)
     
-    if guild_id not in queues or queues[guild_id].empty():
-        await ctx.send("La lista esta vacía.")
+    if is_empty and not curr:
+        await ctx.send("La lista está vacía y no hay nada sonando.")
         return
+
+    embed = create_queue_embed(guild_id)
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def clear(ctx):
+    guild_id = ctx.guild.id
+    bg_task = playlist_tasks.get(guild_id)
+    has_task = bg_task is not None and not bg_task.done()
+    has_queue = guild_id in queues and not queues[guild_id].empty()
+
+    if not has_queue and not has_task:
+        await ctx.send("No hay pistas en espera para limpiar.")
+        return
+
+    if bg_task and not bg_task.done():
+        bg_task.cancel()
+        playlist_tasks[guild_id] = None
+
+    queues[guild_id] = asyncio.Queue()
+    await ctx.send("Cola de espera vaciada. La canción actual continuará sonando.")
     
-    songs_list = list(queues[guild_id]._queue)
-    text_list = "**Lista de reproducción actual:**\n"
-    for i, song in enumerate(songs_list[:10]):
-        text_list += f"{i+1}. {song['title']}\n"
-        if i == 9:
-            text_list += "... y más canciones en espera.\n"
-            break
-        
-    await ctx.send(text_list)
-        
+def get_spotify_playlist_tracks(playlist_url):
+    embed_url = playlist_url.replace("open.spotify.com/playlist/", "open.spotify.com/embed/playlist/")
+    headers = {'User-Agent': 'Mozilla/5.0'}
     
+    try:
+        response = requests.get(embed_url, headers=headers)
+        if response.status_code != 200:
+            return []
+
+        start = response.text.find('__NEXT_DATA__')
+        if start == -1:
+            return []
+            
+        start = response.text.find('>', start) + 1
+        end = response.text.find('</script>', start)
+        
+        data = json.loads(response.text[start:end])
+        track_list = data['props']['pageProps']['state']['data']['entity'].get('trackList', [])
+        
+        return [f"{track['subtitle']} {track['title']}" for track in track_list if 'title' in track and 'subtitle' in track]
+    except Exception as e:
+        print(f"[Spotify Scraper] Error al obtener playlist: {e}")
+        return []
+
 if __name__ == "__main__":
     bot.run(TK_DISCORD)
