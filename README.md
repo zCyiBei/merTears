@@ -8,6 +8,7 @@
     <img src="https://img.shields.io/badge/PyNaCl_(Opus)-4B8BBE?style=for-the-badge&logo=pypi&logoColor=white" alt="PyNaCl" />
     <img src="https://img.shields.io/badge/AsyncIO-00599C?style=for-the-badge&logo=cplusplus&logoColor=white" alt="AsyncIO" />
     <img src="https://img.shields.io/badge/Dotenv-ECD53F?style=for-the-badge&logo=dotenv&logoColor=black" alt="Dotenv" />
+    <img src="https://img.shields.io/badge/Spotify-1ED760?style=for-the-badge&logo=spotify&logoColor=white" alt="Spotify" />
 </p>
 
 Local Discord music bot powered by yt-dlp and FFmpeg
