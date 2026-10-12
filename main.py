@@ -1,10 +1,14 @@
-import os, sys, discord, yt_dlp, asyncio
+import os, sys, discord, yt_dlp, asyncio, spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
 from dotenv import load_dotenv
 from discord.ext import commands
 
 load_dotenv()
 
 TK_DISCORD = os.getenv("TK_DISCORD")
+SPOTIPY_CLIENT_ID = os.getenv("SPTFY")
+SPOTIPY_CLIENT_SECRET = os.getenv("SPTFYS")
+
 
 if not TK_DISCORD:
     sys.exit("Error: Token no especificado en variables de entorno")
@@ -29,6 +33,9 @@ loop_states = {}
 queues = {}
 current_track = {}
 last_player_message = {}
+sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(
+        client_id=SPOTIPY_CLIENT_ID, 
+        client_secret=SPOTIPY_CLIENT_SECRET))
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -36,7 +43,7 @@ class MusicControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    # --- FILA 0 (3 botones de flujo de audio) ---
+    # --- FILA 0 (4 botones de flujo de audio) ---
     @discord.ui.button(label="Pause", style=discord.ButtonStyle.secondary, emoji="⏸️", row=0)
     async def pause_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         client_voice = interaction.guild.voice_client
@@ -68,7 +75,7 @@ class MusicControls(discord.ui.View):
         else:
             await interaction.response.send_message("No hay nada que saltar.", ephemeral=True)
             
-    # --- FILA 1 (3 botones de lista y parada) ---
+    # --- FILA 1 (4 botones de lista y parada) ---
     @discord.ui.button(label="Loop", style=discord.ButtonStyle.secondary, emoji="🔁", row=0)
     async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = interaction.guild_id
@@ -202,7 +209,7 @@ async def play_next(ctx):
     client_voice.play(source, after=after_playing)
 
     dur = song.get('duration') or 0
-    dur_str = f"{dur // 60:02d}:{dur % 60:02d}" if dur > 0 else "🔴 EN VIVO"
+    dur_str = f"{dur // 60:02d}:{dur % 66:02d}" if dur > 0 else "EN VIVO"
 
     embed = discord.Embed(
         title="♫ Reproduciendo Ahora",
@@ -230,6 +237,33 @@ async def play_next(ctx):
 
     new_msg = await ctx.send(embed=embed, view=MusicControls())
     last_player_message[guild_id] = new_msg
+    
+async def load_spotify_playlist_background(ctx, queries, requester):
+    guild_id = ctx.guild.id
+
+    for query in queries:
+        if ctx.guild.voice_client is None:
+            break
+        try:
+            info = ytdl.extract_info(f"ytsearch1:{query}", download=False)
+            if 'entries' in info and len(info['entries']) > 0:
+                first_entry = info['entries'][0]
+                
+                song = {
+                    'url': first_entry['url'],
+                    'title': first_entry.get('title', query),
+                    'duration': first_entry.get('duration', 0),
+                    'thumbnail': first_entry.get('thumbnail'),
+                    'webpage_url': first_entry.get('webpage_url', ''),
+                    'requester': requester
+                }
+                
+                if guild_id in queues:
+                    await queues[guild_id].put(song)
+        except Exception as e:
+            print(f"[Spotify Bridge] Error buscando '{query}': {e}")
+            
+        await asyncio.sleep(1.5)
 
 @bot.command()
 async def play(ctx,* , search):
@@ -242,13 +276,44 @@ async def play(ctx,* , search):
         
     client_voice = ctx.guild.voice_client
     
-    if not search.startswith("http"):
-        search = f"ytsearch:{search}"
+    if "open.spotify.com/track/" in search:
+        track_data = sp.track(search)
+        query = f"{track_data['artists'][0]['name']} {track_data['name']}"
+        search = f"ytsearch1:{query}"
+        
+    elif "open.spotify.com/playlist/" in search:
+        results = sp.playlist_items(search)
+        queries = []
+        for item in results.get('items', []):
+            track = item.get('track')
+            if track and track.get('name') and track.get('artists'):
+                queries.append(f"{track['artists'][0]['name']} {track['name']}")
+                
+        if not queries:
+            await ctx.send("No se encontraron pistas válidas en la playlist.")
+            return
+        
+        search = f"ytsearch1:{queries[0]}"
+        
+        if len(queries) > 1:
+            await ctx.send(f"Playlist de Spotify detectada: Cargando {len(queries)} pistas...", delete_after=8)
+            asyncio.create_task(load_spotify_playlist_background(ctx, queries[1:], ctx.author.display_name))
+    
+    if not search.startswith("http") and not search.startswith("ytsearch"):
+        search = f"ytsearch1:{search}"
     
     info = ytdl.extract_info(search, download=False)
+    
     if 'entries' in info:
+        if not info['entries']:
+            await ctx.send("No se encontró ningún resultado en YouTube para esta búsqueda.")
+            return
         info = info['entries'][0]
-        
+
+    if not info or 'url' not in info:
+        await ctx.send("No se pudo extraer el audio de la pista solicitada.")
+        return
+
     url_stream = info['url']
     title = info.get('title', 'Canción desconocida')
     song = {'url': url_stream, 'title': title, 'duration': info.get('duration', 0),'thumbnail': info.get('thumbnail'),'webpage_url': info.get('webpage_url', search),'requester': ctx.author.display_name}
@@ -258,7 +323,6 @@ async def play(ctx,* , search):
 
     if client_voice.is_playing() or client_voice.is_paused():
         await queues[ctx.guild.id].put(song)
-        # Se borra solo a los 6 segundos para no desfasar el chat
         await ctx.send(f"Añadido a la lista: **{title}**", delete_after=6)
     else:
         await queues[ctx.guild.id].put(song)
