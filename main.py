@@ -26,7 +26,6 @@ FFMPEG_OPTIONS = {
 # Mapping
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 loop_states = {}
-current_tracks = {}
 queues = {}
 current_track = {}
 last_player_message = {}
@@ -83,26 +82,27 @@ class MusicControls(discord.ui.View):
         client_voice = interaction.guild.voice_client
         guild_id = interaction.guild_id
         if client_voice and (client_voice.is_playing() or client_voice.is_paused()):
-            queues[guild_id] = []
+            queues[guild_id] = asyncio.Queue()
             loop_states[guild_id] = False
             current_track[guild_id] = None
             client_voice.stop()
-            await interaction.response.send_message("Reproducción detenida y cola vaciada.", ephemeral=True)
+            await interaction.response.send_message("Reproducción detenida y lista vaciada.", ephemeral=True)
         else:
             await interaction.response.send_message("No hay ninguna pista sonando.", ephemeral=True)
         
-    @discord.ui.button(label="Cola", style=discord.ButtonStyle.secondary, emoji="📜", row=1)
+    @discord.ui.button(label="Queue", style=discord.ButtonStyle.secondary, emoji="📜", row=1)
     async def queue_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild_id = interaction.guild_id
-        if guild_id not in queues or len(queues[guild_id]) == 0:
-            await interaction.response.send_message("La cola está vacía.", ephemeral=True)
+        if guild_id not in queues or queues[guild_id].empty():
+            await interaction.response.send_message("La lista está vacía.", ephemeral=True)
             return
 
-        text_list = "**Cola de reproducción actual:**\n"
-        for i, song in enumerate(queues[guild_id][:10]):
+        songs_list = list(queues[guild_id]._queue)
+        text_list = "**Lista de reproducción actual:**\n"
+        for i, song in enumerate(songs_list[:10]):
             text_list += f"{i+1}. {song['title']}\n"
-        if len(queues[guild_id]) > 10:
-            text_list += f"... y {len(queues[guild_id]) - 10} más en espera.\n"
+        if len(songs_list) > 10:
+            text_list += f"... y {len(songs_list) - 10} más en espera.\n"
 
         await interaction.response.send_message(text_list, ephemeral=True)
 
@@ -110,6 +110,28 @@ class MusicControls(discord.ui.View):
 async def on_ready():
     
     print(f"Sesión establecida con éxito como: {bot.user}")
+    
+@bot.event
+async def on_voice_state_update(member, before, after):
+    if member.id != bot.user.id:
+        return
+    
+    if before.channel is not None and after.channel is None:
+        guild_id = member.guild.id
+        
+        queues[guild_id] = asyncio.Queue()
+        current_track[guild_id] = None
+        loop_states[guild_id] = False
+
+        old_msg = last_player_message.get(guild_id)
+        if old_msg:
+            try:
+                await old_msg.delete()
+            except discord.NotFound:
+                pass
+            last_player_message[guild_id] = None
+
+        print(f"[AutoClean] {member.guild.name} tras abandonar la llamada")
     
 @bot.command()
 async def join(ctx):
@@ -142,7 +164,7 @@ async def leave(ctx):
     if client_voice.is_playing() or client_voice.is_paused():
         client_voice.stop()
         
-    queues[guild_id] = []
+    queues[guild_id] = asyncio.Queue()
     current_track[guild_id] = None
     loop_states[guild_id] = False
 
@@ -157,15 +179,14 @@ async def play_next(ctx):
         return
     
     if loop_states.get(guild_id, False) and current_track.get(guild_id):
-        queues[guild_id].insert(0, current_track[guild_id])
-    
-    if guild_id not in queues or len(queues[guild_id]) == 0:
-        current_track[guild_id] = None
-        await ctx.send("La cola de reproducción ha finalizado.")
-        return
-    
-    song = queues[guild_id].pop(0)
-    current_track[guild_id] = song
+        song = current_track[guild_id]
+    else:
+        if guild_id not in queues or queues[guild_id].empty():
+            current_track[guild_id] = None
+            await ctx.send("La lista de reproducción ha finalizado.")
+            return
+        song = queues[guild_id].get_nowait()
+        current_track[guild_id] = song
     
     if client_voice.is_playing() or client_voice.is_paused():
         client_voice.stop()
@@ -233,14 +254,14 @@ async def play(ctx,* , search):
     song = {'url': url_stream, 'title': title, 'duration': info.get('duration', 0),'thumbnail': info.get('thumbnail'),'webpage_url': info.get('webpage_url', search),'requester': ctx.author.display_name}
     
     if ctx.guild.id not in queues:
-        queues[ctx.guild.id] = []
+        queues[ctx.guild.id] = asyncio.Queue()
 
     if client_voice.is_playing() or client_voice.is_paused():
-        queues[ctx.guild.id].append(song)
+        await queues[ctx.guild.id].put(song)
         # Se borra solo a los 6 segundos para no desfasar el chat
-        await ctx.send(f" Añadido a la cola: **{title}**", delete_after=6)
+        await ctx.send(f"Añadido a la lista: **{title}**", delete_after=6)
     else:
-        queues[ctx.guild.id].append(song)
+        await queues[ctx.guild.id].put(song)
         await play_next(ctx)
     
 @bot.command()
@@ -306,12 +327,13 @@ async def loop(ctx):
 async def queue(ctx):
     guild_id = ctx.guild.id
     
-    if guild_id not in queues or len(queues[guild_id]) == 0:
-        await ctx.send("La cola esta vacía.")
+    if guild_id not in queues or queues[guild_id].empty():
+        await ctx.send("La lista esta vacía.")
         return
     
-    text_list = "**Cola de reproducción actual:**\n"
-    for i, song in enumerate(queues[guild_id]):
+    songs_list = list(queues[guild_id]._queue)
+    text_list = "**Lista de reproducción actual:**\n"
+    for i, song in enumerate(songs_list[:10]):
         text_list += f"{i+1}. {song['title']}\n"
         if i == 9:
             text_list += "... y más canciones en espera.\n"
