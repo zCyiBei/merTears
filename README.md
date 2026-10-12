@@ -59,3 +59,4 @@ python main.py
 - !queue
 - !stop
 - !leave
+- !clear
